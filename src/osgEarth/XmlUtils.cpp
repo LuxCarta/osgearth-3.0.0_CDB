@@ -169,8 +169,12 @@ XmlElement::findElement(const std::string& name) const
                 i != getChildren().end() && result == 0L;
                 i++ )
             {
-                XmlElement* e = (XmlElement*)i->get();
-                result = e->findElement( name );
+                // Only elements have children; casting a text node to XmlElement reads garbage.
+                if ( i->get()->isElement() )
+                {
+                    XmlElement* e = (XmlElement*)i->get();
+                    result = e->findElement( name );
+                }
             }
         }
     }

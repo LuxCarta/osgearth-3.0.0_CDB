@@ -504,8 +504,12 @@ CDBImageLayer::openImplementation()
 				osg::ref_ptr<const SpatialReference> src_srs;
 				src_srs = SpatialReference::create("EPSG:4326");
 				GeoExtent extents = GeoExtent(src_srs, min_lon, min_lat, max_lon, max_lat);
-				DataExtentList& Layerextents = (DataExtentList)getDataExtents();
-				Layerextents.push_back(DataExtent(extents, 0, maxcdbdatalevel + Number_of_Negitive_LODs_to_Use + 1)); //plus number of sublevels
+				// Must modify the layer's own list: casting getDataExtents() to a value only filled a temporary,
+				// so osgEarth never knew the data's max level and kept requesting non-existent deeper LODs.
+				// Max level is inclusive: maxcdblevel plus the negative LODs mapped below CDB LOD 0
+				// (the former "+ 1" made osgEarth request a CDB LOD that does not exist).
+				dataExtents().push_back(DataExtent(extents, 0, maxcdbdatalevel + Number_of_Negitive_LODs_to_Use));
+				dirtyDataExtents();
 				setProfile(osgEarth::Profile::create(src_srs, min_lon, min_lat, max_lon, max_lat, tiles_x, tiles_y));
 
 				OE_INFO "CDB Profile Min Lon " << min_lon << " Min Lat " << min_lat << " Max Lon " << max_lon << " Max Lat " << max_lat << "Tiles " << tiles_x << " " << tiles_y << std::endl;
@@ -526,8 +530,8 @@ CDBImageLayer::openImplementation()
 		osg::ref_ptr<const SpatialReference> src_srs;
 		src_srs = SpatialReference::create("EPSG:4326");
 		GeoExtent extents = GeoExtent(SpatialReference::create("EPSG:4326"), -180.0, -90.0, 180.0, 90.0);
-		DataExtentList& Layerextents = (DataExtentList)getDataExtents();
-		Layerextents.push_back(DataExtent(extents, 0, maxcdbdatalevel + Number_of_Negitive_LODs_to_Use));
+		dataExtents().push_back(DataExtent(extents, 0, maxcdbdatalevel + Number_of_Negitive_LODs_to_Use));
+		dirtyDataExtents();
 		//	   setProfile(osgEarth::Profile::create(src_srs, -180.0, -102.0, 204.0, 90.0, 6U, 3U));
 		setProfile(osgEarth::Profile::create(src_srs, -180.0, -102.0, 204.0, 90.0, 12U, 6U));
 		if (!_UseCache)
@@ -625,7 +629,11 @@ CDBElevationLayer::openImplementation()
     if (status.isError())
         return status;
 
-    setProfile(_imageLayer->getProfile());            
+    setProfile(_imageLayer->getProfile());
+
+    // The extents (coverage + max CDB level) live on the inner image layer; expose them here too.
+    dataExtents() = _imageLayer->getDataExtents();
+    dirtyDataExtents();
 
     return Status::NoError;
 }

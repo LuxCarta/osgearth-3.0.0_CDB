@@ -82,6 +82,7 @@ CDBFeatureSource::Options::getConfig() const
 	conf.set("verbose", _Verbose);
 	conf.set("materials", _Enable_Subord_Material);
 	conf.set("abszinm", _ABS_Z_in_M);
+	conf.set("use_cdb_elevation", _USE_CDB_Elevation);
 	conf.set("featruesgpkg", _Use_GPKG_For_Features);
 	conf.set("lights", _Lights);
 	conf.set("lights_lod", _LightLOD);
@@ -112,6 +113,10 @@ CDBFeatureSource::Options::fromConfig(const Config& conf)
 	conf.get("verbose", _Verbose);
 	conf.get("materials", _Enable_Subord_Material);
 	conf.get("abszinm", _ABS_Z_in_M);
+	// Settle AHGT=false instances on the CDB elevation (option existed but was never read from config).
+	// NOTE: CDBElevationService still returns wrong heights (pyramid children get GeoPackage-style names and
+	// never resolve); prefer the style's "altitude-clamping: terrain" for relative-height models.
+	conf.get("use_cdb_elevation", _USE_CDB_Elevation);
 	conf.get("featruesgpkg", _Use_GPKG_For_Features);
 	conf.get("lights", _Lights);
 	conf.get("lights_lod", _LightLOD);
@@ -240,7 +245,10 @@ CDBFeatureSource::openImplementation()
 	if (_SettleOnCDB)
 	{
 		_CDBElevations = osgEarth::CDBTile::CDBElevationService::getInstance();
-		_CDBElevations->StartElevationService(_rootString, "", _UsingFileInput);
+		// _rootString is only assigned further down: starting the service with it gave an empty root,
+		// so no elevation tile was ever found and AHGT=false instances stayed at Z=0.
+		std::string elevRoot = options().rootDir().isSet() ? options().rootDir().value() : _rootString;
+		_CDBElevations->StartElevationService(elevRoot, "", _UsingFileInput);
 	}
 
 	// Make sure the root directory is set

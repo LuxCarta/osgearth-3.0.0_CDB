@@ -117,17 +117,16 @@ ModelResource::createNodeFromURI( const URI& uri, const osgDB::Options* dbOption
         OE_INFO << LC << "Loaded " << uri.base() << "(from " << (r.isFromCache()? "cache" : "source") << ")"
             << std::endl;
 
+        // MERGE_GEOMETRY / INDEX_MESH / VERTEX_PRE|POSTTRANSFORM removed: on CDB OpenFlight GT models
+        // they crash the pager threads (access violation in IndexMeshVisitor's VertexAttribComparitor).
+        // They are GPU vertex-cache optimisations only.
         osgUtil::Optimizer o;
         o.optimize( node,
             o.REMOVE_REDUNDANT_NODES |
             o.COMBINE_ADJACENT_LODS  |
-            o.MERGE_GEOMETRY         |
             o.MAKE_FAST_GEOMETRY     |
             o.CHECK_GEOMETRY         |
-            o.SHARE_DUPLICATE_STATE  |
-            o.INDEX_MESH             |
-            o.VERTEX_PRETRANSFORM    |
-            o.VERTEX_POSTTRANSFORM );
+            o.SHARE_DUPLICATE_STATE );
         
 
         // Disable automatic texture unref since resources can be shared/paged.

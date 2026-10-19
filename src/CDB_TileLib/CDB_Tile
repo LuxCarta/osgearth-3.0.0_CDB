@@ -425,6 +425,11 @@ namespace osgEarth {
 
 			CDB_Model_Runtime_Class Current_Feature_Class_Data(void);
 
+			// GSModelGeometry archive holding the model of the current feature (own tile, or ancestor tile when MLOD < tile LOD).
+			std::string Current_Model_Archive(void);
+
+			std::string Ancestor_Model_Archive(const std::string &ownArchive, int mlod);
+
 			CDB_AP_Light_Class  Current_AF_Light_Class_Data(void);
 
 			CDB_Env_Light_Class  Current_Env_Light_Class_Data(void);
@@ -514,6 +519,7 @@ namespace osgEarth {
 			bool					m_EnableMaterialMask;
 			bool					m_DataFromGlobal;
 			CDB_Model_Runtime_Class m_CurFeatureClass;
+			std::string				m_CurModelArchive;
 			CDB_AP_Light_Class      m_CurAfLightClass;
 			CDB_Env_Light_Class		m_CurEnvLightClass;
 			GDALDataset *			m_GlobalDataset;

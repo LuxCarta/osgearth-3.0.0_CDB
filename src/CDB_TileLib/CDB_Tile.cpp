@@ -24,6 +24,8 @@
 #include <osgEarth/XmlUtils>
 #include <osgDB/FileUtils>
 #include <osgDB/FileNameUtils>
+#include <map>
+#include <mutex>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -1477,7 +1479,9 @@ bool osgEarth::CDBTile::CDB_Tile::Open_GS_Model_Tile(void)
 			}
 			else
 			{
-				if (m_ModelSet[i].ModelWorkingNameExists && m_ModelSet[i].ModelDbfNameExists && m_ModelSet[i].ModelGeometryNameExists)
+				// No ModelGeometryNameExists check: with MLOD (OGC CDB 1.2 Vol.1 10.7.1.3.39) every model of the tile
+				// may be stored in an ancestor tile archive, so the tile can legitimately have no archive of its own.
+				if (m_ModelSet[i].ModelWorkingNameExists && m_ModelSet[i].ModelDbfNameExists)
 				{
 					GDALOpenInfo oOpenInfoP(m_ModelSet[i].ModelWorkingName.c_str(), GA_ReadOnly);
 					m_ModelSet[i].PrimaryTileOgr = m_GDAL.poDriver->pfnOpen(&oOpenInfoP);
@@ -1529,7 +1533,7 @@ bool osgEarth::CDBTile::CDB_Tile::Open_GS_Model_Tile(void)
 		}
 		else
 		{
-			if (m_ModelSet[i].ModelWorkingNameExists && m_ModelSet[i].ModelDbfNameExists && m_ModelSet[i].ModelGeometryNameExists)
+			if (m_ModelSet[i].ModelWorkingNameExists && m_ModelSet[i].ModelDbfNameExists)  // archive optional (MLOD)
 				valid_set = true;
 			if (valid_set)
 				Have_a_Valid_set = true;
@@ -1890,6 +1894,55 @@ bool osgEarth::CDBTile::CDB_Tile::Init_Map_Tile(void)
 	return true;
 }
 
+// File list of a GSModelGeometry archive, cached (archives referenced through MLOD are shared by many tiles).
+static osgDB::Archive::FileNameList* cdb_cached_archive_list(const std::string &name)
+{
+	static std::mutex s_mutex;
+	static std::map<std::string, osgDB::Archive::FileNameList> s_lists;
+	std::lock_guard<std::mutex> lock(s_mutex);
+	std::map<std::string, osgDB::Archive::FileNameList>::iterator it = s_lists.find(name);
+	if (it == s_lists.end())
+	{
+		osgDB::Archive::FileNameList list;
+		osg::ref_ptr<osgDB::Archive> ar = osgDB::openArchive(name, osgDB::ReaderWriter::ArchiveStatus::READ);
+		if (ar)
+			ar->getFileNames(list);
+		it = s_lists.insert(std::make_pair(name, list)).first;
+	}
+	return &it->second;
+}
+
+// Archive of the ancestor tile at LOD mlod. OGC CDB 1.2 Vol.1 7.1.4: for positive LODs a tile at LOD n is
+// covered by one tile at LOD m < n, whose UREF/RREF are those of the tile shifted right by (n - m).
+std::string osgEarth::CDBTile::CDB_Tile::Ancestor_Model_Archive(const std::string &ownArchive, int mlod)
+{
+	int lod = m_CDB_LOD_Num;
+	if (mlod < 0 || mlod >= lod || m_uref_str.size() < 2 || m_rref_str.size() < 2)
+		return ownArchive;
+	int u = atoi(m_uref_str.c_str() + 1) >> (lod - mlod);
+	int r = atoi(m_rref_str.c_str() + 1) >> (lod - mlod);
+	char lodbuf[8];
+	snprintf(lodbuf, sizeof(lodbuf), "L%02d", mlod);
+	std::string L = lodbuf, U = "U" + std::to_string(u), R = "R" + std::to_string(r);
+	std::string out = ownArchive;
+	std::string dirOld = "\\" + m_lod_str + "\\" + m_uref_str + "\\", dirNew = "\\" + L + "\\" + U + "\\";
+	std::string fnOld = "_" + m_lod_str + "_" + m_uref_str + "_" + m_rref_str, fnNew = "_" + L + "_" + U + "_" + R;
+	size_t p = out.rfind(dirOld);
+	if (p == std::string::npos)
+		return ownArchive;
+	out.replace(p, dirOld.size(), dirNew);
+	p = out.rfind(fnOld);
+	if (p == std::string::npos)
+		return ownArchive;
+	out.replace(p, fnOld.size(), fnNew);
+	return out;
+}
+
+std::string osgEarth::CDBTile::CDB_Tile::Current_Model_Archive(void)
+{
+	return m_CurModelArchive;
+}
+
 bool osgEarth::CDBTile::CDB_Tile::Model_Geometry_Name(std::string &GeometryName, unsigned int pos)
 {
 	if (m_TileType != GeoSpecificModel)
@@ -1995,6 +2048,7 @@ OGRFeature * osgEarth::CDBTile::CDB_Tile::Next_Valid_Geospecific_Feature(bool in
 		else
 			clsmap = &m_ModelSet[pos].clsMap;
 	}
+	m_CurModelArchive = "";
 	while (!valid && !done)
 	{
 		f = m_ModelSet[pos].FeatureSet.GetNextFeature();
@@ -2042,7 +2096,15 @@ OGRFeature * osgEarth::CDBTile::CDB_Tile::Next_Valid_Geospecific_Feature(bool in
 				else
 				{
 					FullModelName = Model_FileName(m_CurFeatureClass.FACC_value, m_CurFeatureClass.FSC_value, m_CurFeatureClass.Model_Base_Name);
-					ArchiveFileName = archive_validate_modelname(m_ModelSet[pos].archiveFileList, FullModelName);
+					m_CurModelArchive = m_ModelSet[pos].ModelGeometryName;
+					if (m_CurFeatureClass.mlod >= 0 && m_CurFeatureClass.mlod < m_CDB_LOD_Num)
+					{
+						// OGC CDB 1.2 Vol.1 10.7.1.3.39: MLOD "indicates the LOD where the corresponding MODL is found".
+						m_CurModelArchive = Ancestor_Model_Archive(m_ModelSet[pos].ModelGeometryName, m_CurFeatureClass.mlod);
+						ArchiveFileName = archive_validate_modelname(*cdb_cached_archive_list(m_CurModelArchive), ModelKeyName);
+					}
+					else
+						ArchiveFileName = archive_validate_modelname(m_ModelSet[pos].archiveFileList, FullModelName);
 					if (ArchiveFileName.empty())
 						Model_in_Archive = false;
 					else
@@ -2394,7 +2456,10 @@ bool osgEarth::CDBTile::CDB_Tile::Init_GS_Model_Tile(unsigned int pos)
 		else
 			have_class = Load_Class_Map(poLayer, m_ModelSet[pos].clsMap);
 	}
-	bool have_archive = Load_Archive(m_ModelSet[pos].ModelGeometryName, m_ModelSet[pos].archiveFileList);
+	// Archive optional: models may be referenced from ancestor tiles through MLOD.
+	if (m_ModelSet[pos].ModelGeometryNameExists)
+		Load_Archive(m_ModelSet[pos].ModelGeometryName, m_ModelSet[pos].archiveFileList);
+	bool have_archive = true;
 	if(m_ModelSet[pos].APLightsExists)
 	{
 		Load_AF_Lights(pos);
@@ -2933,7 +2998,7 @@ bool osgEarth::CDBTile::CDB_Tile::Tile_Exists(int sel)
 		return m_FileExists;
 	else if (m_TileType == GeoSpecificModel)
 	{
-		if (m_FileExists && m_ModelSet[sel].ModelDbfNameExists && m_ModelSet[sel].ModelGeometryNameExists)
+		if (m_FileExists && m_ModelSet[sel].ModelDbfNameExists)  // archive optional (MLOD)
 			return true;
 		else
 			return false;

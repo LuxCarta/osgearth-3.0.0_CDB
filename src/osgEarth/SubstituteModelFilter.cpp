@@ -350,6 +350,9 @@ SubstituteModelFilter::process(const FeatureList&           features,
         scaleZEx  = *modelSymbol->scaleZ();
     }
 	osg::ref_ptr<osgDB::Archive> ar = NULL;
+	// With MLOD (OGC CDB 1.2 Vol.1 10.7.1.3.39) the features of one tile may reference models stored in
+	// different archives (the tile's own and ancestor tiles'), so archives are opened per feature, cached by name.
+	std::map<std::string, osg::ref_ptr<osgDB::Archive> > archives;
 
 	bool Do_Editing_Support = false;
 
@@ -383,12 +386,14 @@ SubstituteModelFilter::process(const FeatureList&           features,
             calculateGeometryHeading(input, context);
         }
 		
-		if ((ar == NULL) && input->hasAttr("osge_modelzip"))  
+		if (input->hasAttr("osge_modelzip"))
 		{
-			//all model requests should come from the same archive
 			//the existance and validity of the archive has already been tested by the driver
 			archiveName = input->getString("osge_modelzip");
-			ar = osgDB::openArchive(archiveName, osgDB::ReaderWriter::ArchiveStatus::READ);
+			osg::ref_ptr<osgDB::Archive>& cached = archives[archiveName];
+			if (!cached.valid())
+				cached = osgDB::openArchive(archiveName, osgDB::ReaderWriter::ArchiveStatus::READ);
+			ar = cached.get();
 		}
 
 #ifdef _DO_GPKG_TESTS
@@ -733,11 +738,10 @@ SubstituteModelFilter::process(const FeatureList&           features,
     }
 
 
-	if (ar)
-	{
-		ar.release();
-		ar = NULL;
-	}
+	// Same lifetime policy as before for every archive used by this tile: release without closing.
+	for (std::map<std::string, osg::ref_ptr<osgDB::Archive> >::iterator a = archives.begin(); a != archives.end(); ++a)
+		a->second.release();
+	ar = NULL;
 
 
 	if (Do_Editing_Support)

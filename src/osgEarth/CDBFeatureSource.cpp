@@ -756,9 +756,10 @@ bool CDBFeatureSource::getFeatures(osgEarth::CDBTile::CDB_Tile *mainTile, const 
 	{
 		if (!_CDB_geoTypical)
 		{
-			have_archive = mainTile->Model_Geometry_Name(ModelZipFile, sel);
-			if (!have_archive)
-				return false;
+			mainTile->Model_Geometry_Name(ModelZipFile, sel);
+			// The tile may have no archive of its own: with MLOD (OGC CDB 1.2 Vol.1 10.7.1.3.39) its models can all be
+			// stored in ancestor tiles. Validity is decided per feature (Model_in_Archive).
+			have_archive = true;
 			have_texture_zipfile = mainTile->Model_Texture_Archive(TextureZipFile, sel);
 			if (_UsingFileInput && !have_texture_zipfile)
 			{
@@ -801,6 +802,10 @@ bool CDBFeatureSource::getFeatures(osgEarth::CDBTile::CDB_Tile *mainTile, const 
 		if (!Model_in_Archive)
 			valid_model = false;
 
+		// Archive holding this feature's model: the tile's own, or an ancestor tile's when MLOD < tile LOD.
+		std::string FeatureZipFile = ModelZipFile;
+		if (!_CDB_geoTypical && !_CDB_inflated && !mainTile->Current_Model_Archive().empty())
+			FeatureZipFile = mainTile->Current_Model_Archive();
 		CDB_Model_Runtime_Class FeatureClass = mainTile->Current_Feature_Class_Data();
 
 		double ZoffsetPos = 0.0;
@@ -874,7 +879,7 @@ bool CDBFeatureSource::getFeatures(osgEarth::CDBTile::CDB_Tile *mainTile, const 
 		++_cur_Feature_Cnt;
 		if (!_CDB_inflated)
 		{
-			f->set("osge_modelzip", ModelZipFile);
+			f->set("osge_modelzip", FeatureZipFile);
 		}//end else !cdb_inflated
 		if (valid_model)
 		{

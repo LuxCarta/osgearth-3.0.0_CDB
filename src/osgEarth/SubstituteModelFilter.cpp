@@ -599,6 +599,10 @@ SubstituteModelFilter::process(const FeatureList&           features,
 			if (model)
 			{
 				model->getOrCreateStateSet()->setMode(GL_DEPTH_TEST, osg::StateAttribute::ON | osg::StateAttribute::OVERRIDE);
+				// CDB debug overlay: version rank of this GS model (set by CDBFeatureSource).
+				// (int): getInt() returns long long, which would create an INT64 uniform the GLSL int ignores.
+				if (input->hasAttr("cdb_version"))
+					model->getOrCreateStateSet()->addUniform(new osg::Uniform("oe_cdb_version", (int)input->getInt("cdb_version")));
 				if(!skip_multitexdisable)
 					model->accept(v);
 			}

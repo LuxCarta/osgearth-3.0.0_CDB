@@ -24,6 +24,79 @@
 #include <osgEarth/MVT>
 #include <osgEarth/Registry>
 #include <cdbGlobals/cdbGlobals>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <regex>
+
+namespace
+{
+	// Debug overlay support: version rank of a GS model (1 = coarsest version of that building).
+	// CDB repeats a GS instance in every finer tile (Vol.1 7.1.4 Req. 16) with the model of that LOD; a new
+	// version starts where the model's vertex count (class attribute NVT) changes. The rank is the number of
+	// distinct versions met from LOD 0 down to the tile's LOD, read from the class files (_T002_) of the
+	// ancestor tiles.
+	typedef std::map<std::string, int> ModlNvtMap;
+	std::mutex s_nvtMutex;
+	std::map<std::string, std::shared_ptr<ModlNvtMap> > s_nvtCache;
+
+	std::shared_ptr<ModlNvtMap> classNvt(const std::string& dbf)
+	{
+		std::lock_guard<std::mutex> lock(s_nvtMutex);
+		std::map<std::string, std::shared_ptr<ModlNvtMap> >::iterator it = s_nvtCache.find(dbf);
+		if (it != s_nvtCache.end())
+			return it->second;
+		std::shared_ptr<ModlNvtMap> m(new ModlNvtMap());
+		GDALDataset* ds = (GDALDataset*)GDALOpenEx(dbf.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY, NULL, NULL, NULL);
+		if (ds)
+		{
+			OGRLayer* layer = ds->GetLayer(0);
+			int iModl = layer ? layer->GetLayerDefn()->GetFieldIndex("MODL") : -1;
+			int iNvt = layer ? layer->GetLayerDefn()->GetFieldIndex("NVT") : -1;
+			if (iModl >= 0 && iNvt >= 0)
+			{
+				layer->ResetReading();
+				while (OGRFeature* f = layer->GetNextFeature())
+				{
+					(*m)[f->GetFieldAsString(iModl)] = f->GetFieldAsInteger(iNvt);
+					OGRFeature::DestroyFeature(f);
+				}
+			}
+			GDALClose(ds);
+		}
+		s_nvtCache[dbf] = m;
+		return m;
+	}
+
+	int gsVersionRank(const std::string& instanceShp, const std::string& modl)
+	{
+		// ...\100_GSFeature\L06\U38\N42E009_D100_S001_T001_L06_U38_R31.shp
+		static const std::regex re(R"(^(.*[\\/])L(\d\d)[\\/]U(\d+)[\\/]([NS]\d\d[EW]\d\d\d)_D100_S(\d{3})_T001_L\d\d_U\d+_R(\d+)\.shp$)",
+			std::regex::icase);
+		std::smatch m;
+		if (!std::regex_match(instanceShp, m, re))
+			return 0;
+		const std::string root = m[1], cell = m[4], sel = m[5];
+		const int lod = std::stoi(m[2]), u = std::stoi(m[3]), r = std::stoi(m[6]);
+		int rank = 0, last = -1;
+		for (int a = 0; a <= lod; ++a)
+		{
+			char name[512];
+			snprintf(name, sizeof(name), "%sL%02d\\U%d\\%s_D100_S%s_T002_L%02d_U%d_R%d.dbf",
+				root.c_str(), a, u >> (lod - a), cell.c_str(), sel.c_str(), a, u >> (lod - a), r >> (lod - a));
+			std::shared_ptr<ModlNvtMap> nvt = classNvt(name);
+			ModlNvtMap::const_iterator it = nvt->find(modl);
+			if (it == nvt->end())
+				continue;
+			if (rank == 0 || it->second != last)
+			{
+				++rank;
+				last = it->second;
+			}
+		}
+		return rank;
+	}
+}
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -847,6 +920,8 @@ bool CDBFeatureSource::getFeatures(osgEarth::CDBTile::CDB_Tile *mainTile, const 
 		++_s_CDB_FeatureID;
 
 		f->set("osge_basename", ModelKeyName);
+		if (!_CDB_geoTypical)
+			f->set("cdb_version", gsVersionRank(buffer, FeatureClass.Model_Base_Name));   // debug overlay
 
 		if (_CDB_Edit_Support)
 		{

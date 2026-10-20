@@ -236,30 +236,38 @@ namespace
     }
 
     /**
-     * CDB LOD debug overlay: tints every feature tile with the colour of the CDB LOD it was loaded from
-     * (uniform oe_cdb_lod, set per tile). Toggled with the 'o' key, or on at start with CDB_LOD_OVERLAY=1.
-     * Palette: L00 red, L01 orange, L02 yellow, L03 lime, L04 green, L05 cyan, L06 blue, L07 violet,
-     * L08 magenta, L09+ white.
+     * CDB debug overlay on feature models, cycled with the 'o' key (or set at start with CDB_LOD_OVERLAY=1|2):
+     *   mode 1 - model version (uniform oe_cdb_version, per GS model, computed by CDBFeatureSource):
+     *            1st/coarsest version blue, 2nd yellow, 3rd red, 4th+ white
+     *   mode 2 - CDB LOD of the tile the model was loaded from (uniform oe_cdb_lod, per tile):
+     *            L00 red, L01 orange, L02 yellow, L03 lime, L04 green, L05 cyan, L06 blue, L07 violet,
+     *            L08 magenta, L09+ white
      */
     const char* s_cdbLodTintFS =
         "#version " GLSL_VERSION_STR "\n"
         GLSL_DEFAULT_PRECISION_FLOAT "\n"
+        "uniform int oe_cdb_overlay; \n"
         "uniform int oe_cdb_lod; \n"
-        "uniform bool oe_cdb_lod_debug; \n"
+        "uniform int oe_cdb_version; \n"
         "void oe_cdb_lod_tint(inout vec4 color) \n"
         "{ \n"
-        "    if (!oe_cdb_lod_debug || oe_cdb_lod < 0) return; \n"
-        "    const vec3 pal[10] = vec3[10]( \n"
-        "        vec3(1.0, 0.0, 0.0), vec3(1.0, 0.5, 0.0), vec3(1.0, 1.0, 0.0), vec3(0.5, 1.0, 0.0), \n"
-        "        vec3(0.0, 0.8, 0.0), vec3(0.0, 1.0, 1.0), vec3(0.0, 0.4, 1.0), vec3(0.6, 0.0, 1.0), \n"
-        "        vec3(1.0, 0.0, 1.0), vec3(1.0, 1.0, 1.0)); \n"
-        "    color.rgb = mix(color.rgb, pal[clamp(oe_cdb_lod, 0, 9)], 0.65); \n"
+        "    if (oe_cdb_overlay == 1 && oe_cdb_version > 0) { \n"
+        "        const vec3 ver[4] = vec3[4](vec3(0.0, 0.3, 1.0), vec3(1.0, 0.9, 0.0), vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0)); \n"
+        "        color.rgb = mix(color.rgb, ver[clamp(oe_cdb_version - 1, 0, 3)], 0.65); \n"
+        "    } \n"
+        "    else if (oe_cdb_overlay == 2 && oe_cdb_lod >= 0) { \n"
+        "        const vec3 pal[10] = vec3[10]( \n"
+        "            vec3(1.0, 0.0, 0.0), vec3(1.0, 0.5, 0.0), vec3(1.0, 1.0, 0.0), vec3(0.5, 1.0, 0.0), \n"
+        "            vec3(0.0, 0.8, 0.0), vec3(0.0, 1.0, 1.0), vec3(0.0, 0.4, 1.0), vec3(0.6, 0.0, 1.0), \n"
+        "            vec3(1.0, 0.0, 1.0), vec3(1.0, 1.0, 1.0)); \n"
+        "        color.rgb = mix(color.rgb, pal[clamp(oe_cdb_lod, 0, 9)], 0.65); \n"
+        "    } \n"
         "} \n";
 
     struct CdbLodOverlayToggle : public osg::NodeCallback
     {
-        osg::ref_ptr<osg::Uniform> _enabled;
-        CdbLodOverlayToggle(osg::Uniform* u) : _enabled(u) { }
+        osg::ref_ptr<osg::Uniform> _mode;
+        CdbLodOverlayToggle(osg::Uniform* u) : _mode(u) { }
         void operator()(osg::Node* node, osg::NodeVisitor* nv) override
         {
             osgGA::EventVisitor* ev = dynamic_cast<osgGA::EventVisitor*>(nv);
@@ -270,12 +278,17 @@ namespace
                     osgGA::GUIEventAdapter* ea = (*e)->asGUIEventAdapter();
                     if (ea && ea->getEventType() == osgGA::GUIEventAdapter::KEYDOWN && ea->getKey() == 'o')
                     {
-                        bool on = false;
-                        _enabled->get(on);
-                        _enabled->set(!on);
-                        OE_NOTICE << "[CDB] LOD overlay " << (!on ? "ON" : "OFF")
-                            << " (L00 red, L01 orange, L02 yellow, L03 lime, L04 green, L05 cyan, L06 blue, L07 violet, L08 magenta, L09+ white)"
-                            << std::endl;
+                        int mode = 0;
+                        _mode->get(mode);
+                        mode = (mode + 1) % 3;
+                        _mode->set(mode);
+                        if (mode == 0)
+                            OE_NOTICE << "[CDB] overlay OFF" << std::endl;
+                        else if (mode == 1)
+                            OE_NOTICE << "[CDB] overlay: model version (1st/coarsest blue, 2nd yellow, 3rd red, 4th+ white)" << std::endl;
+                        else
+                            OE_NOTICE << "[CDB] overlay: tile CDB LOD (L00 red, L01 orange, L02 yellow, L03 lime, L04 green, "
+                                         "L05 cyan, L06 blue, L07 violet, L08 magenta, L09+ white)" << std::endl;
                     }
                 }
             }
@@ -632,8 +645,10 @@ FeatureModelGraph::open()
         VirtualProgram* vp = VirtualProgram::getOrCreate(ss);
         vp->setFunction("oe_cdb_lod_tint", s_cdbLodTintFS, ShaderComp::LOCATION_FRAGMENT_COLORING, 1.5f);
         ss->addUniform(new osg::Uniform("oe_cdb_lod", -1));
+        ss->addUniform(new osg::Uniform("oe_cdb_version", 0));
         const char* env = ::getenv("CDB_LOD_OVERLAY");
-        osg::Uniform* overlay = new osg::Uniform("oe_cdb_lod_debug", env != 0L && *env != 0 && *env != '0');
+        int mode = (env != 0L && (*env == '1' || *env == '2')) ? (*env - '0') : 0;
+        osg::Uniform* overlay = new osg::Uniform("oe_cdb_overlay", mode);
         ss->addUniform(overlay);
         setEventCallback(new CdbLodOverlayToggle(overlay));
     }

@@ -19,8 +19,11 @@
 
 #include <osgEarth/FeatureModelGraph>
 #include <osgEarth/VirtualProgram>
+#include <osgEarth/Text>
 #include <osgGA/EventVisitor>
 #include <osgGA/GUIEventAdapter>
+#include <atomic>
+#include <iomanip>
 #include <osgEarth/CropFilter>
 #include <osgEarth/FeatureSourceIndexNode>
 #include <osgEarth/FilterContext>
@@ -264,6 +267,44 @@ namespace
         "    } \n"
         "} \n";
 
+    // Current overlay mode (0 off, 1 model version, 2 tile LOD), shared with the tile labels.
+    std::atomic<int> s_cdbOverlayMode(0);
+
+    // Tile labels are drawn only while the overlay is on.
+    struct CdbLabelCull : public osg::NodeCallback
+    {
+        void operator()(osg::Node* node, osg::NodeVisitor* nv) override
+        {
+            if (s_cdbOverlayMode.load() != 0)
+                traverse(node, nv);
+        }
+    };
+
+    // Screen-facing label at the centre of a CDB feature tile, on top of everything.
+    osg::Node* makeCdbTileLabel(const GeoExtent& extent, const std::string& label)
+    {
+        GeoPoint p(extent.getSRS(), extent.getCentroid().x(), extent.getCentroid().y(), 0.0, ALTMODE_ABSOLUTE);
+        osg::Matrixd local2world;
+        if (!p.createLocalToWorld(local2world))
+            return 0L;
+        osgEarth::Text* text = new osgEarth::Text(label);
+        text->setFont(Registry::instance()->getDefaultFont());
+        text->setCharacterSize(16.0f);
+        text->setCharacterSizeMode(osgText::Text::SCREEN_COORDS);
+        text->setAutoRotateToScreen(true);
+        text->setAlignment(osgText::Text::CENTER_CENTER);
+        text->setColor(osg::Vec4(1, 1, 1, 1));
+        text->setBackdropType(osgText::Text::OUTLINE);
+        text->setBackdropColor(osg::Vec4(0, 0, 0, 1));
+        osg::MatrixTransform* mt = new osg::MatrixTransform(local2world);
+        mt->addChild(text);
+        osg::StateSet* ss = mt->getOrCreateStateSet();
+        ss->setMode(GL_DEPTH_TEST, osg::StateAttribute::OFF | osg::StateAttribute::OVERRIDE);
+        ss->setRenderBinDetails(INT_MAX - 1, "DepthSortedBin");
+        mt->setCullCallback(new CdbLabelCull());
+        return mt;
+    }
+
     struct CdbLodOverlayToggle : public osg::NodeCallback
     {
         osg::ref_ptr<osg::Uniform> _mode;
@@ -282,6 +323,7 @@ namespace
                         _mode->get(mode);
                         mode = (mode + 1) % 3;
                         _mode->set(mode);
+                        s_cdbOverlayMode = mode;
                         if (mode == 0)
                             OE_NOTICE << "[CDB] overlay OFF" << std::endl;
                         else if (mode == 1)
@@ -353,6 +395,9 @@ namespace
             if (!allLoaded && _own)
                 _own->accept(nv);
         }
+
+        // Camera distance (from the tile centre) under which the subtiles replace this tile; 0 if no subtiles.
+        float cutoff() const { return _subtiles.empty() ? 0.0f : _cutoff; }
 
     private:
         // Both are children of this group, which keeps them alive.
@@ -649,6 +694,7 @@ FeatureModelGraph::open()
         const char* env = ::getenv("CDB_LOD_OVERLAY");
         int mode = (env != 0L && (*env == '1' || *env == '2')) ? (*env - '0') : 0;
         osg::Uniform* overlay = new osg::Uniform("oe_cdb_overlay", mode);
+        s_cdbOverlayMode = mode;
         ss->addUniform(overlay);
         setEventCallback(new CdbLodOverlayToggle(overlay));
     }
@@ -1047,6 +1093,7 @@ FeatureModelGraph::load(
         // "tile size factor" ... see below.
         osg::Group* geometry = 0L;
         osg::Vec3d tileCenter;
+        GeoExtent cdbTileExtent;
         const FeatureProfile* featureProfile = _session->getFeatureSource()->getFeatureProfile();
 
         if ((int)lod >= featureProfile->getFirstLevel())
@@ -1077,6 +1124,7 @@ FeatureModelGraph::load(
 //			osg::BoundingSphered tileBound = getBoundInWorldCoords(tileExtent, &mapf);
 			osg::BoundingSphered tileBound = getBoundInWorldCoords(tileExtent);
 			tileCenter = tileBound.center();
+			cdbTileExtent = tileExtent;
 
             // Apply the tile range multiplier to calculate a max camera range. The max range is
             // the geographic radius of the tile times the multiplier.
@@ -1114,6 +1162,23 @@ FeatureModelGraph::load(
 
                 result = group.release();
             }
+        }
+
+        // CDB debug overlay: label the tile with its LOD and the distance under which its subtiles replace it.
+        if (geometry && _options.layout().isSet() && _options.layout()->profiletileing() == true)
+        {
+            TileReplacementGroup* rg = dynamic_cast<TileReplacementGroup*>(result);
+            float cutoff = rg ? rg->cutoff() : 0.0f;
+            std::ostringstream s;
+            s << "L" << std::setw(2) << std::setfill('0') << lod;
+            if (cutoff > 0.0f)
+                s << "  ->  L" << std::setw(2) << std::setfill('0') << (lod + 1)
+                  << " < " << std::fixed << std::setprecision(2) << (cutoff / 1000.0f) << " km";
+            else
+                s << "  (finest)";
+            osg::Node* label = makeCdbTileLabel(cdbTileExtent, s.str());
+            if (label)
+                geometry->addChild(label);
         }
     }
 

@@ -239,13 +239,14 @@ namespace
     }
 
     /**
-     * CDB debug overlay on feature models, cycled with the 'o' key (or set at start with CDB_LOD_OVERLAY=1|2):
+     * CDB debug overlay on feature models, cycled with the 'o' key (or set at start with CDB_LOD_OVERLAY=1|2|3):
      *   mode 1 - model version, relative to the building's own versions (uniform oe_cdb_version, per GS
      *            model, computed by CDBFeatureSource): coarsest blue, intermediate yellow, finest red
      *            (single-version buildings are red)
      *   mode 2 - CDB LOD of the tile the model was loaded from (uniform oe_cdb_lod, per tile):
      *            L00 red, L01 orange, L02 yellow, L03 lime, L04 green, L05 cyan, L06 blue, L07 violet,
      *            L08 magenta, L09+ white
+     *   mode 3 - tile labels only, models keep their own colours
      */
     const char* s_cdbLodTintFS =
         "#version " GLSL_VERSION_STR "\n"
@@ -268,7 +269,7 @@ namespace
         "    } \n"
         "} \n";
 
-    // Current overlay mode (0 off, 1 model version, 2 tile LOD), shared with the tile labels.
+    // Current overlay mode (0 off, 1 model version, 2 tile LOD, 3 labels only), shared with the tile labels.
     std::atomic<int> s_cdbOverlayMode(0);
 
     // Tile labels are drawn only while the overlay is on.
@@ -322,13 +323,15 @@ namespace
                     {
                         int mode = 0;
                         _mode->get(mode);
-                        mode = (mode + 1) % 3;
+                        mode = (mode + 1) % 4;
                         _mode->set(mode);
                         s_cdbOverlayMode = mode;
                         if (mode == 0)
                             OE_NOTICE << "[CDB] overlay OFF" << std::endl;
                         else if (mode == 1)
                             OE_NOTICE << "[CDB] overlay: model version (coarsest blue, intermediate yellow, finest red)" << std::endl;
+                        else if (mode == 3)
+                            OE_NOTICE << "[CDB] overlay: tile labels only" << std::endl;
                         else
                             OE_NOTICE << "[CDB] overlay: tile CDB LOD (L00 red, L01 orange, L02 yellow, L03 lime, L04 green, "
                                          "L05 cyan, L06 blue, L07 violet, L08 magenta, L09+ white)" << std::endl;
@@ -693,7 +696,7 @@ FeatureModelGraph::open()
         ss->addUniform(new osg::Uniform("oe_cdb_lod", -1));
         ss->addUniform(new osg::Uniform("oe_cdb_version", 0));
         const char* env = ::getenv("CDB_LOD_OVERLAY");
-        int mode = (env != 0L && (*env == '1' || *env == '2')) ? (*env - '0') : 0;
+        int mode = (env != 0L && (*env >= '1' && *env <= '3')) ? (*env - '0') : 0;
         osg::Uniform* overlay = new osg::Uniform("oe_cdb_overlay", mode);
         s_cdbOverlayMode = mode;
         ss->addUniform(overlay);

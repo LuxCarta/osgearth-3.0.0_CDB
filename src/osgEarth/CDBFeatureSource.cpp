@@ -24,6 +24,8 @@
 #include <osgEarth/MVT>
 #include <osgEarth/Registry>
 #include <cdbGlobals/cdbGlobals>
+#include <osg/Math>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -31,11 +33,10 @@
 
 namespace
 {
-	// Debug overlay support: version rank of a GS model (1 = coarsest version of that building).
+	// Debug overlay support: which version of a GS building a tile holds, relative to all its versions.
 	// CDB repeats a GS instance in every finer tile (Vol.1 7.1.4 Req. 16) with the model of that LOD; a new
-	// version starts where the model's vertex count (class attribute NVT) changes. The rank is the number of
-	// distinct versions met from LOD 0 down to the tile's LOD, read from the class files (_T002_) of the
-	// ancestor tiles.
+	// version starts where the model's vertex count (class attribute NVT) changes. Versions are counted along
+	// the building's tile chain, LOD 0 to the finest LOD present, using the class files (_T002_).
 	typedef std::map<std::string, int> ModlNvtMap;
 	std::mutex s_nvtMutex;
 	std::map<std::string, std::shared_ptr<ModlNvtMap> > s_nvtCache;
@@ -68,33 +69,50 @@ namespace
 		return m;
 	}
 
-	int gsVersionRank(const std::string& instanceShp, const std::string& modl)
+	// Returns the overlay class of the building's model in this tile: 1 = coarsest version (blue),
+	// 2 = intermediate (yellow), 3 = finest version of that building (red; also for single-version buildings),
+	// 0 = unknown. lon/lat: instance position, used to follow the building into finer tiles.
+	int gsVersionClass(const std::string& instanceShp, const std::string& modl, double lon, double lat)
 	{
 		// ...\100_GSFeature\L06\U38\N42E009_D100_S001_T001_L06_U38_R31.shp
-		static const std::regex re(R"(^(.*[\\/])L(\d\d)[\\/]U(\d+)[\\/]([NS]\d\d[EW]\d\d\d)_D100_S(\d{3})_T001_L\d\d_U\d+_R(\d+)\.shp$)",
+		static const std::regex re(R"(^(.*[\\/])L(\d\d)[\\/]U\d+[\\/](([NS])(\d\d)([EW])(\d\d\d))_D100_S(\d{3})_T001_L\d\d_U\d+_R\d+\.shp$)",
 			std::regex::icase);
 		std::smatch m;
 		if (!std::regex_match(instanceShp, m, re))
 			return 0;
-		const std::string root = m[1], cell = m[4], sel = m[5];
-		const int lod = std::stoi(m[2]), u = std::stoi(m[3]), r = std::stoi(m[6]);
-		int rank = 0, last = -1;
-		for (int a = 0; a <= lod; ++a)
+		const std::string root = m[1], cell = m[3], sel = m[8];
+		const int lod = std::stoi(m[2]);
+		const double cellLat = (m[4] == "S" || m[4] == "s" ? -1.0 : 1.0) * std::stoi(m[5]);
+		const double cellLon = (m[6] == "W" || m[6] == "w" ? -1.0 : 1.0) * std::stoi(m[7]);
+		// OGC CDB 1.2 Vol.1: a geocell spans 1 degree of latitude and Get_Lon_Step() degrees of longitude;
+		// at LOD a >= 0 it is split into 2^a x 2^a tiles, UREF counted from the south, RREF from the west.
+		const double lonStep = osgEarth::CDBTile::CDB_Tile::Get_Lon_Step(cellLat);
+		int versions = 0, versionHere = 0, last = -1;
+		for (int a = 0; a <= 23; ++a)
 		{
+			const double n = (double)(1 << a);
+			const int u = osg::clampBetween((int)std::floor((lat - cellLat) * n), 0, (1 << a) - 1);
+			const int r = osg::clampBetween((int)std::floor((lon - cellLon) / lonStep * n), 0, (1 << a) - 1);
 			char name[512];
 			snprintf(name, sizeof(name), "%sL%02d\\U%d\\%s_D100_S%s_T002_L%02d_U%d_R%d.dbf",
-				root.c_str(), a, u >> (lod - a), cell.c_str(), sel.c_str(), a, u >> (lod - a), r >> (lod - a));
+				root.c_str(), a, u, cell.c_str(), sel.c_str(), a, u, r);
 			std::shared_ptr<ModlNvtMap> nvt = classNvt(name);
+			if (nvt->empty() && a > lod)
+				break;                              // no finer tile here: end of the chain
 			ModlNvtMap::const_iterator it = nvt->find(modl);
-			if (it == nvt->end())
-				continue;
-			if (rank == 0 || it->second != last)
+			if (it != nvt->end() && (versions == 0 || it->second != last))
 			{
-				++rank;
+				++versions;
 				last = it->second;
 			}
+			if (a == lod)
+				versionHere = versions;
 		}
-		return rank;
+		if (versionHere == 0)
+			return 0;
+		if (versionHere == versions)
+			return 3;
+		return versionHere == 1 ? 1 : 2;
 	}
 }
 #ifdef _WIN32
@@ -920,8 +938,12 @@ bool CDBFeatureSource::getFeatures(osgEarth::CDBTile::CDB_Tile *mainTile, const 
 		++_s_CDB_FeatureID;
 
 		f->set("osge_basename", ModelKeyName);
-		if (!_CDB_geoTypical)
-			f->set("cdb_version", gsVersionRank(buffer, FeatureClass.Model_Base_Name));   // debug overlay
+		if (!_CDB_geoTypical)   // debug overlay: version class of this building's model
+		{
+			OGRPoint* pt = dynamic_cast<OGRPoint*>(feat_handle->GetGeometryRef());
+			if (pt)
+				f->set("cdb_version", gsVersionClass(buffer, FeatureClass.Model_Base_Name, pt->getX(), pt->getY()));
+		}
 
 		if (_CDB_Edit_Support)
 		{

@@ -240,8 +240,9 @@ namespace
 
     /**
      * CDB debug overlay on feature models, cycled with the 'o' key (or set at start with CDB_LOD_OVERLAY=1|2):
-     *   mode 1 - model version (uniform oe_cdb_version, per GS model, computed by CDBFeatureSource):
-     *            1st/coarsest version blue, 2nd yellow, 3rd red, 4th+ white
+     *   mode 1 - model version, relative to the building's own versions (uniform oe_cdb_version, per GS
+     *            model, computed by CDBFeatureSource): coarsest blue, intermediate yellow, finest red
+     *            (single-version buildings are red)
      *   mode 2 - CDB LOD of the tile the model was loaded from (uniform oe_cdb_lod, per tile):
      *            L00 red, L01 orange, L02 yellow, L03 lime, L04 green, L05 cyan, L06 blue, L07 violet,
      *            L08 magenta, L09+ white
@@ -327,7 +328,7 @@ namespace
                         if (mode == 0)
                             OE_NOTICE << "[CDB] overlay OFF" << std::endl;
                         else if (mode == 1)
-                            OE_NOTICE << "[CDB] overlay: model version (1st/coarsest blue, 2nd yellow, 3rd red, 4th+ white)" << std::endl;
+                            OE_NOTICE << "[CDB] overlay: model version (coarsest blue, intermediate yellow, finest red)" << std::endl;
                         else
                             OE_NOTICE << "[CDB] overlay: tile CDB LOD (L00 red, L01 orange, L02 yellow, L03 lime, L04 green, "
                                          "L05 cyan, L06 blue, L07 violet, L08 magenta, L09+ white)" << std::endl;

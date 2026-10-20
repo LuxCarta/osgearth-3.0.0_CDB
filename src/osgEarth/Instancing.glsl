@@ -9,6 +9,10 @@ $GLSL_DEFAULT_PRECISION_FLOAT
 #pragma vp_order      0.0
 
 uniform samplerBuffer oe_di_postex_TBO;
+// Camera-distance range [min, max) in which this geometry is drawn, per instance (osg::LOD children, see
+// ConvertToDrawInstanced::apply(osg::LOD&)). Default (0, FLT_MAX).
+uniform vec2 oe_di_lod_range;
+uniform mat4 osg_ModelViewMatrix;
 
 // Stage-global containing object ID
 uint oe_index_objectid;
@@ -30,6 +34,15 @@ void oe_di_setInstancePosition(inout vec4 VertexMODEL)
     // rebuild positioning matrix and transform the vert. (Note, the matrix is actually
     // transposed so we have to reverse the multiplication order.)
     mat4 xform = mat4(m0, m1, m2, vec4(0,0,0,1));
+
+    // Per-instance LOD selection: outside its range, collapse this geometry to the instance origin.
+    vec3 origin = vec3(m0.w, m1.w, m2.w);
+    float range = length((osg_ModelViewMatrix * vec4(origin, 1.0)).xyz);
+    if (range < oe_di_lod_range.x || range >= oe_di_lod_range.y)
+    {
+        VertexMODEL = vec4(origin, 1.0);
+        return;
+    }
 
     VertexMODEL = VertexMODEL * xform;
 

@@ -204,24 +204,19 @@ ConvertToDrawInstanced::apply(osg::Drawable& drawable)
 void
 ConvertToDrawInstanced::apply(osg::LOD& lod)
 {
-    // find the highest LOD:
-    int   minIndex = 0;
-    float minRange = FLT_MAX;
-    for(unsigned i=0; i<lod.getNumRanges(); ++i)
+    // An osg::LOD cannot select per instance (it is evaluated once for the whole draw-instanced batch). Keep every
+    // child, traverse them all, and let the instancing vertex shader select per instance: each child carries its
+    // range in "oe_di_lod_range" (camera distance to the instance origin), see Instancing.glsl. The previous code
+    // kept only the finest child, so models with LODs (e.g. CDB GT trees, OGC 16-009r4 Vol.6 6.8) always showed
+    // their finest version.
+    for (unsigned i = 0; i < lod.getNumChildren() && i < lod.getNumRanges(); ++i)
     {
-        if ( lod.getRangeList()[i].first < minRange )
-        {
-            minRange = lod.getRangeList()[i].first;
-            minIndex = i;
-        }
+        // A shared model may be converted more than once: keep the range recorded by the first conversion.
+        osg::StateSet* ss = lod.getChild(i)->getOrCreateStateSet();
+        if (!ss->getUniform("oe_di_lod_range"))
+            ss->addUniform(new osg::Uniform("oe_di_lod_range", osg::Vec2f(lod.getMinRange(i), lod.getMaxRange(i))));
+        lod.setRange(i, 0.0f, FLT_MAX);
     }
-
-    // remove all but the highest:
-    osg::ref_ptr<osg::Node> highestLOD = lod.getChild( minIndex );
-    lod.removeChildren( 0, lod.getNumChildren() );
-
-    // add it back with a full range.
-    lod.addChild( highestLOD.get(), 0.0f, FLT_MAX );
 
     apply(static_cast<osg::Group&>(lod));
 }
@@ -436,6 +431,8 @@ DrawInstanced::convertGraphToUseDrawInstanced( osg::Group* parent )
         osg::StateSet* stateset = instanceGroup->getOrCreateStateSet();
         stateset->setTextureAttribute(cdi.getTextureImageUnit(), posTBO);
         stateset->getOrCreateUniform("oe_di_postex_TBO", osg::Uniform::SAMPLER_BUFFER)->set(cdi.getTextureImageUnit());
+        // Default per-instance LOD range (no LOD): always drawn. LOD children override it (ConvertToDrawInstanced).
+        stateset->getOrCreateUniform("oe_di_lod_range", osg::Uniform::FLOAT_VEC2)->set(osg::Vec2f(0.0f, FLT_MAX));
 
         // Tell the SG to skip the positioning TBO.
         ShaderGenerator::setIgnoreHint(posTBO, true);

@@ -30,43 +30,104 @@
 #include <memory>
 #include <mutex>
 #include <regex>
+#include <vector>
+#include <cstdio>
 
 namespace
 {
 	// Debug overlay support: which version of a GS building a tile holds, relative to all its versions.
-	// CDB repeats a GS instance in every finer tile (Vol.1 7.1.4 Req. 16) with the model of that LOD; a new
-	// version starts where the model's vertex count (class attribute NVT) changes. Versions are counted along
-	// the building's tile chain, LOD 0 to the finest LOD present, using the class files (_T002_).
-	typedef std::map<std::string, int> ModlNvtMap;
-	std::mutex s_nvtMutex;
-	std::map<std::string, std::shared_ptr<ModlNvtMap> > s_nvtCache;
+	// CDB repeats a GS instance in every finer tile (Vol.1 7.1.4 Req. 16) with the model of that LOD, stored in
+	// that tile's GSModelGeometry archive or, through MLOD (Vol.1 10.7.1.3.39), in an ancestor's. A version is
+	// identified by the CRC-32 and size of the model entry, read from the archive's central directory, so
+	// identical copies at successive LODs and MLOD references both count as the same version.
+	struct ClassInfo { int mlod; std::string key; };      // key = FACC_FSC_MODL
+	typedef std::map<std::string, ClassInfo> ClassMap;     // MODL -> class info
+	std::mutex s_classMutex;
+	std::map<std::string, std::shared_ptr<ClassMap> > s_classCache;
 
-	std::shared_ptr<ModlNvtMap> classNvt(const std::string& dbf)
+	std::shared_ptr<ClassMap> classInfo(const std::string& dbf)
 	{
-		std::lock_guard<std::mutex> lock(s_nvtMutex);
-		std::map<std::string, std::shared_ptr<ModlNvtMap> >::iterator it = s_nvtCache.find(dbf);
-		if (it != s_nvtCache.end())
+		std::lock_guard<std::mutex> lock(s_classMutex);
+		std::map<std::string, std::shared_ptr<ClassMap> >::iterator it = s_classCache.find(dbf);
+		if (it != s_classCache.end())
 			return it->second;
-		std::shared_ptr<ModlNvtMap> m(new ModlNvtMap());
+		std::shared_ptr<ClassMap> m(new ClassMap());
 		GDALDataset* ds = (GDALDataset*)GDALOpenEx(dbf.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY, NULL, NULL, NULL);
 		if (ds)
 		{
 			OGRLayer* layer = ds->GetLayer(0);
-			int iModl = layer ? layer->GetLayerDefn()->GetFieldIndex("MODL") : -1;
-			int iNvt = layer ? layer->GetLayerDefn()->GetFieldIndex("NVT") : -1;
-			if (iModl >= 0 && iNvt >= 0)
+			OGRFeatureDefn* d = layer ? layer->GetLayerDefn() : 0L;
+			int iModl = d ? d->GetFieldIndex("MODL") : -1, iMlod = d ? d->GetFieldIndex("MLOD") : -1;
+			int iFacc = d ? d->GetFieldIndex("FACC") : -1, iFsc = d ? d->GetFieldIndex("FSC") : -1;
+			if (iModl >= 0 && iFacc >= 0)
 			{
 				layer->ResetReading();
 				while (OGRFeature* f = layer->GetNextFeature())
 				{
-					(*m)[f->GetFieldAsString(iModl)] = f->GetFieldAsInteger(iNvt);
+					char fsc[8];
+					snprintf(fsc, sizeof(fsc), "%03d", iFsc >= 0 ? f->GetFieldAsInteger(iFsc) : 0);
+					ClassInfo ci;
+					ci.mlod = (iMlod >= 0 && f->IsFieldSetAndNotNull(iMlod)) ? f->GetFieldAsInteger(iMlod) : -1;
+					ci.key = std::string(f->GetFieldAsString(iFacc)) + "_" + fsc + "_" + f->GetFieldAsString(iModl);
+					(*m)[f->GetFieldAsString(iModl)] = ci;
 					OGRFeature::DestroyFeature(f);
 				}
 			}
 			GDALClose(ds);
 		}
-		s_nvtCache[dbf] = m;
+		s_classCache[dbf] = m;
 		return m;
+	}
+
+	// Zip central directory: entry name -> (crc32, uncompressed size). Plain (non-Zip64) archives.
+	typedef std::map<std::string, std::pair<unsigned, unsigned> > ZipDir;
+	std::mutex s_zipMutex;
+	std::map<std::string, std::shared_ptr<ZipDir> > s_zipCache;
+
+	std::shared_ptr<ZipDir> zipDirectory(const std::string& path)
+	{
+		std::lock_guard<std::mutex> lock(s_zipMutex);
+		std::map<std::string, std::shared_ptr<ZipDir> >::iterator it = s_zipCache.find(path);
+		if (it != s_zipCache.end())
+			return it->second;
+		std::shared_ptr<ZipDir> dir(new ZipDir());
+		FILE* fp = fopen(path.c_str(), "rb");
+		if (fp)
+		{
+			fseek(fp, 0, SEEK_END);
+			long size = ftell(fp);
+			long tail = size < 65557 ? size : 65557;
+			std::vector<unsigned char> buf(tail);
+			fseek(fp, size - tail, SEEK_SET);
+			if (fread(buf.data(), 1, tail, fp) == (size_t)tail)
+			{
+				auto u16 = [](const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); };
+				auto u32 = [](const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24); };
+				for (long i = tail - 22; i >= 0; --i)
+				{
+					if (u32(&buf[i]) != 0x06054b50)
+						continue;
+					unsigned count = u16(&buf[i + 10]), cdSize = u32(&buf[i + 12]), cdOff = u32(&buf[i + 16]);
+					std::vector<unsigned char> cd(cdSize);
+					fseek(fp, (long)cdOff, SEEK_SET);
+					if (fread(cd.data(), 1, cdSize, fp) == cdSize)
+					{
+						size_t p = 0;
+						for (unsigned e = 0; e < count && p + 46 <= cd.size() && u32(&cd[p]) == 0x02014b50; ++e)
+						{
+							unsigned nameLen = u16(&cd[p + 28]), extra = u16(&cd[p + 30]), comment = u16(&cd[p + 32]);
+							std::string name((const char*)&cd[p + 46], nameLen);
+							(*dir)[name] = std::make_pair(u32(&cd[p + 16]), u32(&cd[p + 24]));
+							p += 46 + nameLen + extra + comment;
+						}
+					}
+					break;
+				}
+			}
+			fclose(fp);
+		}
+		s_zipCache[path] = dir;
+		return dir;
 	}
 
 	// Returns the overlay class of the building's model in this tile: 1 = coarsest version (blue),
@@ -87,7 +148,10 @@ namespace
 		// OGC CDB 1.2 Vol.1: a geocell spans 1 degree of latitude and Get_Lon_Step() degrees of longitude;
 		// at LOD a >= 0 it is split into 2^a x 2^a tiles, UREF counted from the south, RREF from the west.
 		const double lonStep = osgEarth::CDBTile::CDB_Tile::Get_Lon_Step(cellLat);
-		int versions = 0, versionHere = 0, last = -1;
+		// ...\Tiles\N42\E009\100_GSFeature\ -> ...\Tiles\N42\E009\300_GSModelGeometry\ .
+		const std::string geoRoot = root.substr(0, root.size() - std::string("100_GSFeature\\").size()) + "300_GSModelGeometry\\";
+		int versions = 0, versionHere = 0;
+		std::pair<unsigned, unsigned> last(0, 0);
 		for (int a = 0; a <= 23; ++a)
 		{
 			const double n = (double)(1 << a);
@@ -96,14 +160,25 @@ namespace
 			char name[512];
 			snprintf(name, sizeof(name), "%sL%02d\\U%d\\%s_D100_S%s_T002_L%02d_U%d_R%d.dbf",
 				root.c_str(), a, u, cell.c_str(), sel.c_str(), a, u, r);
-			std::shared_ptr<ModlNvtMap> nvt = classNvt(name);
-			if (nvt->empty() && a > lod)
+			std::shared_ptr<ClassMap> cls = classInfo(name);
+			if (cls->empty() && a > lod)
 				break;                              // no finer tile here: end of the chain
-			ModlNvtMap::const_iterator it = nvt->find(modl);
-			if (it != nvt->end() && (versions == 0 || it->second != last))
+			ClassMap::const_iterator it = cls->find(modl);
+			if (it != cls->end())
 			{
-				++versions;
-				last = it->second;
+				// The model is in the archive of the tile at MLOD (this tile when MLOD is absent or equal).
+				const int ml = (it->second.mlod >= 0 && it->second.mlod <= a) ? it->second.mlod : a;
+				const int mu = u >> (a - ml), mr = r >> (a - ml);
+				char zbase[256], zip[512];
+				snprintf(zbase, sizeof(zbase), "%s_D300_S%s_T001_L%02d_U%d_R%d", cell.c_str(), sel.c_str(), ml, mu, mr);
+				snprintf(zip, sizeof(zip), "%sL%02d\\U%d\\%s.zip", geoRoot.c_str(), ml, mu, zbase);
+				std::shared_ptr<ZipDir> dir = zipDirectory(zip);
+				ZipDir::const_iterator e = dir->find(std::string(zbase) + "_" + it->second.key + ".flt");
+				if (e != dir->end() && (versions == 0 || e->second != last))
+				{
+					++versions;
+					last = e->second;
+				}
 			}
 			if (a == lod)
 				versionHere = versions;

@@ -1298,6 +1298,20 @@ FeatureModelGraph::buildSubTilePagedLODs(
         for (unsigned v = subtileY; v <= subtileY + 1; ++v)
         {
             GeoExtent subtileFeatureExtent = s_getTileExtent(subtileLOD, u, v, _usableFeatureExtent);
+            // Profile tiling: load() reads tile (subtileLOD, u, v) through the tiling profile's TileKey, so the
+            // bound used for culling and range must come from that same key. Halving the usable extent only
+            // matches it when the profile has a single tile at level 0 (one geocell); with several geocells
+            // (e.g. tx=2 ty=2) the bounds were offset and scaled, and the wrong subtiles were culled.
+            if (_options.layout().isSet() && _options.layout()->profiletileing() == true)
+            {
+                const Profile* tiling = _session->getFeatureSource()->getFeatureProfile()->getTilingProfile();
+                if (tiling)
+                {
+                    unsigned nw, nh;
+                    tiling->getNumTiles(subtileLOD, nw, nh);
+                    subtileFeatureExtent = TileKey(subtileLOD, u, nh - v - 1, tiling).getExtent();
+                }
+            }
             osg::BoundingSphered subtile_bs = getBoundInWorldCoords(subtileFeatureExtent);
 
             // Calculate the maximum camera range for the LOD.

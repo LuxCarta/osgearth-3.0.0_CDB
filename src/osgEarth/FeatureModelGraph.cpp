@@ -48,6 +48,7 @@
 #include <osgDB/ReaderWriter>
 #include <osgDB/WriteFile>
 #include <osgUtil/Optimizer>
+#include <osgUtil/CullVisitor>
 
 #include <algorithm>
 #include <iterator>
@@ -230,6 +231,72 @@ namespace
         str = buf.str();
         return str;
     }
+
+    /**
+     * CDB tile replacement (OGC CDB 1.2 Vol.1 7.1.4, Req. 16: "finer tiles replace coarser tiles").
+     * Holds a tile's own geometry and the PagedLODs of its subtiles. Far from the tile only the own geometry is
+     * drawn; within the subtiles' switch-in range the subtiles are drawn instead, the own geometry being kept only
+     * as a fallback while a subtile is (re)loading. Without this the levels were additive: every version of a
+     * GS model repeated at several CDB LODs was drawn on top of the others.
+     */
+    class TileReplacementGroup : public osg::Group
+    {
+    public:
+        void setup(osg::Node* own, const osg::Vec3d& center)
+        {
+            _own = own;
+            _center = center;
+            _cutoff = 0.0f;
+            for (unsigned i = 0; i < getNumChildren(); ++i)
+            {
+                osg::PagedLOD* sub = dynamic_cast<osg::PagedLOD*>(getChild(i));
+                if (!sub)
+                    continue;
+                // The switch decision is taken here, once for the whole tile; the subtile keeps paging in
+                // and out normally but no longer applies its own range test.
+                _cutoff = osg::maximum(_cutoff, sub->getMaxRange(0));
+                sub->setRange(0, 0.0f, FLT_MAX);
+                _subtiles.push_back(sub);
+            }
+        }
+
+        void traverse(osg::NodeVisitor& nv) override
+        {
+            if (nv.getVisitorType() != osg::NodeVisitor::CULL_VISITOR || _subtiles.empty())
+            {
+                osg::Group::traverse(nv);
+                return;
+            }
+            float d = nv.getDistanceToViewPoint(_center, true);
+            if (d >= _cutoff)
+            {
+                if (_own)
+                    _own->accept(nv);
+                return;
+            }
+            // Fall back to the own geometry only while a VISIBLE subtile is still loading: a subtile outside the
+            // view frustum is never traversed, hence never loaded, and must not keep the parent drawn forever.
+            osgUtil::CullVisitor* cv = dynamic_cast<osgUtil::CullVisitor*>(&nv);
+            bool allLoaded = true;
+            for (unsigned i = 0; i < _subtiles.size(); ++i)
+            {
+                if (cv && cv->isCulled(*_subtiles[i]))
+                    continue;
+                if (_subtiles[i]->getNumChildren() == 0)
+                    allLoaded = false;
+                _subtiles[i]->accept(nv);   // draws loaded subtiles, requests the others
+            }
+            if (!allLoaded && _own)
+                _own->accept(nv);
+        }
+
+    private:
+        // Both are children of this group, which keeps them alive.
+        osg::Node* _own = 0L;
+        std::vector<osg::PagedLOD*> _subtiles;
+        osg::Vec3d _center;
+        float _cutoff = 0.0f;
+    };
 
     osg::Group* createPagedNode(const osg::BoundingSphered& bs,
         const std::string& uri,
@@ -900,6 +967,7 @@ FeatureModelGraph::load(
         // We will calcluate the LOD ranges here, as a function of the tile radius and the
         // "tile size factor" ... see below.
         osg::Group* geometry = 0L;
+        osg::Vec3d tileCenter;
         const FeatureProfile* featureProfile = _session->getFeatureSource()->getFeatureProfile();
 
         if ((int)lod >= featureProfile->getFirstLevel())
@@ -929,6 +997,7 @@ FeatureModelGraph::load(
 //			MapFrame mapf = _session->createMapFrame();
 //			osg::BoundingSphered tileBound = getBoundInWorldCoords(tileExtent, &mapf);
 			osg::BoundingSphered tileBound = getBoundInWorldCoords(tileExtent);
+			tileCenter = tileBound.center();
 
             // Apply the tile range multiplier to calculate a max camera range. The max range is
             // the geographic radius of the tile times the multiplier.
@@ -944,7 +1013,9 @@ FeatureModelGraph::load(
         if ((int)lod < featureProfile->getMaxLevel())
         {
             // yes, so build some pagedlods to bring in the next level.
-            osg::ref_ptr<osg::Group> group = new osg::Group();
+            // CDB profile tiling: subtiles REPLACE this tile (Vol.1 7.1.4 Req. 16) instead of adding to it.
+            bool replaceByChildren = geometry != 0L && _options.layout().isSet() && _options.layout()->profiletileing() == true;
+            osg::ref_ptr<osg::Group> group = replaceByChildren ? new TileReplacementGroup() : new osg::Group();
 
             // calculate the LOD of the next level:
             if (lod + 1 != ~0)
@@ -953,6 +1024,8 @@ FeatureModelGraph::load(
                 if (geometry != 0L || (int)lod < featureProfile->getFirstLevel())
                 {
                     buildSubTilePagedLODs(lod, tileX, tileY, group.get(), readOptions);
+                    if (replaceByChildren)
+                        static_cast<TileReplacementGroup*>(group.get())->setup(geometry, tileCenter);
                     group->addChild(geometry);
                 }
 

@@ -30,10 +30,89 @@
 
 #include <osgEarth/Metrics>
 
+#include <osgEarth/GeoData>
+#include <fstream>
+#include <iomanip>
+
 #define LC "[viewer] "
 
 using namespace osgEarth;
 using namespace osgEarth::Util;
+
+// Key 'k': writes the current camera as a Google Earth KML <Camera> (eye position, heading, tilt, horizontal field of
+// view) to camera_<n>.kml in the working directory, and logs it with the manipulator's focal viewpoint. The KML Camera
+// reproduces the exact eye, independently of how each application interprets a focal point and range.
+struct CameraToKml : public osgGA::GUIEventHandler
+{
+    osg::observer_ptr<MapNode> _mapNode;
+    int _count = 0;
+    CameraToKml(MapNode* mapNode) : _mapNode(mapNode) { }
+
+    bool handle(const osgGA::GUIEventAdapter& ea, osgGA::GUIActionAdapter& aa) override
+    {
+        if (ea.getEventType() != ea.KEYDOWN || ea.getKey() != 'k')
+            return false;
+        osgViewer::View* view = dynamic_cast<osgViewer::View*>(&aa);
+        osg::ref_ptr<MapNode> mapNode;
+        if (!view || !_mapNode.lock(mapNode))
+            return false;
+        osg::Camera* cam = view->getCamera();
+
+        osg::Vec3d eye, center, up;
+        cam->getViewMatrixAsLookAt(eye, center, up);
+        GeoPoint eyeGeo;
+        eyeGeo.fromWorld(mapNode->getMapSRS()->getGeographicSRS(), eye);
+
+        // look direction in the local east-north-up frame at the eye
+        osg::Matrixd l2w;
+        eyeGeo.createLocalToWorld(l2w);
+        osg::Matrixd w2l = osg::Matrixd::inverse(l2w);
+        osg::Vec3d dir = (center - eye);
+        dir.normalize();
+        osg::Vec3d d = (eye + dir) * w2l - eye * w2l;            // world -> local east-north-up (OSG row vectors)
+        d.normalize();
+        double heading = osg::RadiansToDegrees(atan2(d.x(), d.y()));
+        if (heading < 0.0) heading += 360.0;
+        double tilt = osg::RadiansToDegrees(acos(osg::clampBetween(-d.z(), -1.0, 1.0)));
+
+        double fovy, aspect, zn, zf;
+        cam->getProjectionMatrixAsPerspective(fovy, aspect, zn, zf);
+        double hfov = osg::RadiansToDegrees(2.0 * atan(tan(osg::DegreesToRadians(fovy) * 0.5) * aspect));
+
+        std::ostringstream vpText;
+        EarthManipulator* em = dynamic_cast<EarthManipulator*>(view->getCameraManipulator());
+        if (em)
+        {
+            Viewpoint vp = em->getViewpoint();
+            vpText << "focal point lat " << vp.focalPoint()->y() << " lon " << vp.focalPoint()->x()
+                   << " alt " << vp.focalPoint()->z() << ", heading " << vp.heading()->as(Units::DEGREES)
+                   << ", pitch " << vp.pitch()->as(Units::DEGREES) << ", range " << vp.range()->as(Units::METERS) << " m";
+        }
+
+        std::ostringstream name;
+        name << "camera_" << ++_count << ".kml";
+        std::ofstream out(name.str().c_str());
+        out << std::setprecision(10)
+            << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            << "<kml xmlns=\"http://www.opengis.net/kml/2.2\" xmlns:gx=\"http://www.google.com/kml/ext/2.2\">\n"
+            << "<Placemark>\n  <name>osgEarth camera " << _count << "</name>\n"
+            << "  <description>Eye altitude is above the WGS84 ellipsoid. osgEarth viewpoint: " << vpText.str()
+            << ". Vertical FOV " << fovy << " deg, aspect " << aspect << ".</description>\n"
+            << "  <Camera>\n"
+            << "    <longitude>" << eyeGeo.x() << "</longitude><latitude>" << eyeGeo.y() << "</latitude>"
+            << "<altitude>" << eyeGeo.z() << "</altitude>\n"
+            << "    <heading>" << heading << "</heading><tilt>" << tilt << "</tilt><roll>0</roll>\n"
+            << "    <altitudeMode>absolute</altitudeMode>\n"
+            << "    <gx:horizFov>" << hfov << "</gx:horizFov>\n"
+            << "  </Camera>\n</Placemark>\n</kml>\n";
+        out.close();
+
+        OE_WARN << LC << name.str() << ": eye lat " << std::setprecision(9) << eyeGeo.y() << " lon " << eyeGeo.x()
+                << " alt " << std::setprecision(6) << eyeGeo.z() << " m, heading " << heading << ", tilt " << tilt
+                << ", hfov " << hfov << " (vfov " << fovy << ", aspect " << aspect << "); " << vpText.str() << std::endl;
+        return true;
+    }
+};
 
 int
 usage(const char* name)
@@ -83,6 +162,9 @@ main(int argc, char** argv)
     if ( node )
     {
         viewer.setSceneData( node );
+        MapNode* mapNode = MapNode::get(node);
+        if (mapNode)
+            viewer.addEventHandler(new CameraToKml(mapNode));
         return Metrics::run(viewer);
     }
     else

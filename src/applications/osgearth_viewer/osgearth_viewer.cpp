@@ -31,6 +31,8 @@
 #include <osgEarth/Metrics>
 
 #include <osgEarth/GeoData>
+#include <osgEarth/Controls>
+#include <osgEarth/Terrain>
 #include <fstream>
 #include <iomanip>
 
@@ -38,6 +40,67 @@
 
 using namespace osgEarth;
 using namespace osgEarth::Util;
+
+// On-screen distances, to evaluate LOD switch distances (key 'd' toggles): camera -> focal point (manipulator range),
+// camera height above the terrain, and camera -> terrain point under the mouse (point at a model's base).
+struct DistanceReadout : public osgGA::GUIEventHandler
+{
+    osg::observer_ptr<MapNode> _mapNode;
+    osg::ref_ptr<Controls::LabelControl> _label;
+    float _mx = -1.0f, _my = -1.0f;
+    DistanceReadout(MapNode* mapNode, osgViewer::View* view) : _mapNode(mapNode)
+    {
+        _label = new Controls::LabelControl("", 16.0f);
+        _label->setHorizAlign(Controls::Control::ALIGN_LEFT);
+        _label->setVertAlign(Controls::Control::ALIGN_TOP);
+        _label->setBackColor(osg::Vec4f(0, 0, 0, 0.6f));
+        _label->setPadding(6.0f);
+        Controls::ControlCanvas::getOrCreate(view)->addControl(_label.get());
+    }
+
+    bool handle(const osgGA::GUIEventAdapter& ea, osgGA::GUIActionAdapter& aa) override
+    {
+        if (ea.getEventType() == ea.MOVE || ea.getEventType() == ea.DRAG)
+        {
+            _mx = ea.getX();
+            _my = ea.getY();
+        }
+        if (ea.getEventType() == ea.KEYDOWN && ea.getKey() == 'd')
+        {
+            _label->setVisible(!_label->visible());
+            return true;
+        }
+        if (ea.getEventType() != ea.FRAME || !_label->visible())
+            return false;
+        osgViewer::View* view = dynamic_cast<osgViewer::View*>(&aa);
+        osg::ref_ptr<MapNode> mapNode;
+        if (!view || !_mapNode.lock(mapNode))
+            return false;
+
+        osg::Vec3d eye, center, up;
+        view->getCamera()->getViewMatrixAsLookAt(eye, center, up);
+        std::ostringstream s;
+        s << std::fixed << std::setprecision(0);
+
+        EarthManipulator* em = dynamic_cast<EarthManipulator*>(view->getCameraManipulator());
+        if (em)
+            s << "range (camera -> focal point): " << em->getViewpoint().range()->as(Units::METERS) << " m\n";
+
+        GeoPoint eyeGeo;
+        eyeGeo.fromWorld(mapNode->getMapSRS()->getGeographicSRS(), eye);
+        double hMsl = 0.0, hEll = 0.0;
+        if (mapNode->getTerrain()->getHeight(eyeGeo.getSRS(), eyeGeo.x(), eyeGeo.y(), &hMsl, &hEll))
+            s << "camera height above ground: " << (eyeGeo.z() - hEll) << " m\n";
+
+        osg::Vec3d world;
+        if (_mx >= 0.0f && mapNode->getTerrain()->getWorldCoordsUnderMouse(view, _mx, _my, world))
+            s << "camera -> point under mouse: " << (world - eye).length() << " m";
+        else
+            s << "camera -> point under mouse: -";
+        _label->setText(s.str());
+        return false;
+    }
+};
 
 // Key 'k': writes the current camera as a Google Earth KML <Camera> (eye position, heading, tilt, horizontal field of
 // view) to camera_<n>.kml in the working directory, and logs it with the manipulator's focal viewpoint. The KML Camera
@@ -164,7 +227,10 @@ main(int argc, char** argv)
         viewer.setSceneData( node );
         MapNode* mapNode = MapNode::get(node);
         if (mapNode)
+        {
             viewer.addEventHandler(new CameraToKml(mapNode));
+            viewer.addEventHandler(new DistanceReadout(mapNode, &viewer));
+        }
         return Metrics::run(viewer);
     }
     else
